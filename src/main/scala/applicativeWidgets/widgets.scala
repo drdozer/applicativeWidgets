@@ -4,6 +4,9 @@ import scalaz._
 import shapeless._
 import shapeless.ops._
 import shapeless.{:+:, Coproduct}
+import shapeless.PolyDefns.~>
+import shapeless.ops.coproduct.Basis
+import shapeless.ops.hlist.ToCoproductTraversable
 
 import scala.annotation.implicitNotFound
 
@@ -15,30 +18,30 @@ object WidgetCommand {
 
   case object Enable extends WidgetCommand
   case object Dissable extends WidgetCommand
+
+
 }
 
 trait WidgetEvent
 
 object WidgetEvent {
-  trait UpdatedTo[T] extends WidgetEvent {
-    def newValue: T
-  }
+  case class UpdatedTo[T](newValue: T) extends WidgetEvent
 }
 
-@implicitNotFound("Could not unwrap a ${A} from ${T}")
-trait Unwrapper[A, T] {
-  def apply(t: T): A
-}
-
-object Unwraper {
-  implicit def at[A, T](implicit ta: T <:< A): Unwrapper[A, T] = new Unwrapper[A, T] {
-    override def apply(t: T) = ta(t)
-  }
-
-  implicit def inTag[A, T, Tag](implicit atT: Unwrapper[A, T]): Unwrapper[A, T @@ Tag] = new Unwrapper[A, @@[T, Tag]] {
-    override def apply(t: @@[T, Tag]) = atT(Tag.unwrap(t))
-  }
-}
+//@implicitNotFound("Could not unwrap a ${A} from ${T}")
+//trait Unwrapper[A, T] {
+//  def apply(t: T): A
+//}
+//
+//object Unwraper {
+//  implicit def at[A, T](implicit ta: T <:< A): Unwrapper[A, T] = new Unwrapper[A, T] {
+//    override def apply(t: T) = ta(t)
+//  }
+//
+//  implicit def inTag[A, T, Tag](implicit atT: Unwrapper[A, T]): Unwrapper[A, T @@ Tag] = new Unwrapper[A, @@[T, Tag]] {
+//    override def apply(t: @@[T, Tag]) = atT(Tag.unwrap(t))
+//  }
+//}
 
 
 /** The widget API.
@@ -47,9 +50,9 @@ object Unwraper {
  * and emmits zero or more of a list of events.
  *
  * @tparam CS    a Coproduct of WidgetCommand types that this widget can handle
- * @tparam ES    a HList of WidgetEvent types that this widget may emmit
+ * @tparam ES    a Coproduct of WidgetEvent types that this widget may emmit
  */
-abstract class WidgetApi[CS <: Coproduct, ES <: HList]
+abstract class WidgetApi[CS <: Coproduct, ES <: Coproduct]
     /*(implicit CS: coproduct.Unifier.Aux[CS, WidgetCommand], ES: LUBConstraint[ES, WidgetEvent])*/
    // todo: implicit witness that CS elements can all be unwrapped to WidgetCommand and ES elements can all be unwrapped to WidgetEvent
 {
@@ -59,32 +62,48 @@ abstract class WidgetApi[CS <: Coproduct, ES <: HList]
    *
    * @tparam Label  the label for this widget.
    */
-  def as[Label](label: Label) = new {
-    def apply[CSES, CSL <: Coproduct, ESL <: HList]
-      (implicit CSES: CSES <:< (CSL, ESL),
-       csl: coproduct.Mapper.Aux[WidgetApi.Labeller.type, CS, CSL],
-       esl: hlist.Mapper.Aux[WidgetApi.Labeller.type, ES, ESL]) = WidgetImpl[CSES, CSL, ESL, CS, ES, Label](
-          widgetApi, label, csl.apply, esl.apply)
+  def as[Label](label: Label)(implicit csl: Labeller[Label, CS], esl: Labeller[Label, ES]) = {
+    WidgetImpl[(csl.Out, esl.Out), csl.Out, esl.Out, CS, ES, Label](
+          widgetApi, label, csl.apply(_ : CS), esl.apply(_ : ES))
   }
 }
 
-object WidgetApi {
+sealed trait Labeller[Label, C <: Coproduct] extends DepFn1[C] with Serializable { type Out <: Coproduct }
 
-  object Labeller extends Poly1 {
-    implicit def caseCommand[A](a: A) = at[A] { a => Tag[A, String](a) }
+object Labeller {
+  def apply[Label, C <: Coproduct](implicit labeller: Labeller[Label, C]): Labeller.Aux[Label, C, labeller.Out] =
+    labeller
+
+  type Aux[Label, C <: Coproduct, Out0 <: Coproduct] = Labeller[Label, C] { type Out <: Out0 }
+  type TagOf[Label] = {
+    type t[A] = A @@ Label
   }
 
+  implicit def cnilMapper[Label]: Aux[Label, CNil, CNil] = new Labeller[Label, CNil] {
+    override type Out = CNil
+    override def apply(t: CNil): CNil = t
+  }
+
+  implicit def cpMapper[Label, H, T <: Coproduct, OutT <: Coproduct]
+  (implicit mt: Labeller.Aux[Label, T, OutT]): Labeller.Aux[Label, H :+: T, TagOf[Label]#t[H] :+: OutT] =
+    new Labeller[Label, H :+: T] {
+      override type Out = TagOf[Label]#t[H] :+: OutT
+      override def apply(c: H :+: T): Out = c match {
+        case Inl(h) => Inl(Tag.of[Label](h))
+        case Inr(t) => Inr(mt(t))
+      }
+    }
 }
 
 /** A labelled widget.
  *
  * A widget is baked from a WidgetApi by adding a label to its commands and events.
  */
-sealed trait WidgetImpl[CSES] {
+trait WidgetImpl[CSES] {
   type LCommands <: Coproduct
-  type LEvents <: HList
+  type LEvents <: Coproduct
   type Commands <: Coproduct
-  type Events <: HList
+  type Events <: Coproduct
   type Label
 
   def api: WidgetApi[Commands, Events]
@@ -95,7 +114,7 @@ sealed trait WidgetImpl[CSES] {
 
 object WidgetImpl {
 
-  def apply[CSES, CSL <: Coproduct, ESL <: HList, CS <: Coproduct, ES <: HList, L](fromApi: WidgetApi[CS, ES], withLabel: L, lcs: CS => CSL, les: ES => ESL)
+  def apply[CSES, CSL <: Coproduct, ESL <: Coproduct, CS <: Coproduct, ES <: Coproduct, L](fromApi: WidgetApi[CS, ES], withLabel: L, lcs: CS => CSL, les: ES => ESL)
       (implicit CSES: CSES <:< (CSL, ESL)) = new WidgetImpl[CSES] {
     override type LCommands = CSL
     override type LEvents = ESL
@@ -109,7 +128,12 @@ object WidgetImpl {
     override val label: Label = withLabel
     override val labelCommands: Commands => LCommands = lcs
     override val labelEvents: Events => LEvents = les
+
+    override def toString: String = s"WidgetImpl($api at $label)"
   }
+
+  def unapply[CSES, CS, ES](wi: WidgetImpl[CSES] { type Commands = CS; type Events = ES}): Option[WidgetApi[CS, ES]] =
+    Some(wi.api)
 
   type Aux[CSES, CSL, ESL, CS, ES, L] = WidgetImpl[CSES] {
     type LCommands = CSL
@@ -122,38 +146,81 @@ object WidgetImpl {
 
 
 trait WidgetDsl {
+  import shapeless.syntax.singleton._
 
   type Widget[A] = FreeAp[WidgetImpl, A]
 
-  def text(txt: String) = FreeAp.lift(Text(txt).as("x").apply)
+  def widget[WF <: WidgetFactory](wf: WF)(implicit
+                                          Commands : Labeller[WF, wf.Commands],
+                                          Events : Labeller[WF, wf.Events]) = new {
+    def apply[CS <: HList, CSO <: Coproduct](initWith: CS)(implicit
+                                                           toCoproductTraversable: ToCoproductTraversable.Aux[CS, List, CSO],
+                                                           basis: Basis[wf.Commands, CSO]) =
+        FreeAp.lift(wf.Widget(toCoproductTraversable(initWith) map (cso => basis.inverse(Right(cso)))).as(wf))
+  }
+
+  def text = widget(Text)
+  def checkbox = widget(Checkbox)
+  def radioButton = widget(RadioButton)
 
 }
 
 
+trait WidgetFactory {
+  type Commands <: Coproduct
+  type Events <: Coproduct
 
-case class Text(txt: String) extends WidgetApi[Text.Set :+: Text.Modify :+: CNil, Text.UpdatedTo :: HNil]
-
-
-object Text {
-  type Set = WidgetCommand.Set[String] @@ Text
-  type Modify = WidgetCommand.Modify[String] @@ Text
-  type UpdatedTo = WidgetEvent.UpdatedTo[String] @@ Text
+  case class Widget(initWith: List[Commands]) extends WidgetApi[Commands, Events]
 }
 
 
-case class Checkbox(enabled: Boolean) extends WidgetApi[Checkbox.Set :+: Checkbox.Modify :+: CNil, Checkbox.UpdatedTo :: HNil]
+object Text extends WidgetFactory {
+  override type Commands = Set :+: Modify :+: CNil
 
-object Checkbox {
-  type Set = WidgetCommand.Set[Boolean] @@ Checkbox
-  type Modify = WidgetCommand.Modify[Boolean] @@ Checkbox
-  type UpdatedTo = WidgetEvent.UpdatedTo[Boolean] @@ Checkbox
+
+  type Set = WidgetCommand.Set[String]
+  def Set(value: String): Set = WidgetCommand.Set(value)
+
+  type Modify = WidgetCommand.Modify[String]
+  def Modify(updateWith: String => String): Modify = WidgetCommand.Modify(updateWith)
+
+
+  type Events = UpdatedTo :+: CNil
+
+  type UpdatedTo = WidgetEvent.UpdatedTo[String]
+  def UpdatedTo(newValue: String): UpdatedTo = WidgetEvent.UpdatedTo(newValue)
 }
 
 
-case class RadioButton(enabled: Boolean) extends WidgetApi[RadioButton.Set :+: RadioButton.Modify :+: CNil, RadioButton.UpdatedTo :: HNil]
+object Checkbox extends WidgetFactory {
+  override type Commands = Set :+: Modify :+: CNil
 
-object RadioButton {
-  type Set = WidgetCommand.Set[Boolean] @@ RadioButton
-  type Modify = WidgetCommand.Modify[Boolean] @@ RadioButton
-  type UpdatedTo = WidgetEvent.UpdatedTo[Boolean] @@ RadioButton
+  type Set = WidgetCommand.Set[Boolean]
+  def Set(value: Boolean): Set = WidgetCommand.Set(value)
+
+  type Modify = WidgetCommand.Modify[Boolean]
+  def Modify(updateWith: Boolean => Boolean): Modify = WidgetCommand.Modify(updateWith)
+
+
+  type Events = UpdatedTo :+: CNil
+
+  type UpdatedTo = WidgetEvent.UpdatedTo[Boolean]
+  def UpdatedTo(newValue: Boolean): UpdatedTo = WidgetEvent.UpdatedTo(newValue)
+}
+
+
+object RadioButton extends WidgetFactory {
+  override type Commands = Set :+: Modify :+: CNil
+
+  type Set = WidgetCommand.Set[Boolean]
+  def Set(value: Boolean): Set = WidgetCommand.Set(value)
+
+  type Modify = WidgetCommand.Modify[Boolean]
+  def Modify(updateWith: Boolean => Boolean): Modify = WidgetCommand.Modify(updateWith)
+
+
+  type Events = UpdatedTo :+: CNil
+
+  type UpdatedTo = WidgetEvent.UpdatedTo[Boolean]
+  def UpdatedTo(newValue: Boolean): UpdatedTo = WidgetEvent.UpdatedTo(newValue)
 }
